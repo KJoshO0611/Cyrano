@@ -1,0 +1,19 @@
+services:
+  easterbunny:
+    image: sleepykei/easterbunny:latest
+    # Removed the build section since we're pulling from repository
+    command: python bot.py  # Optional: Override the default command
+    container_name: easterbunny
+    restart: unless-stopped
+    environment:
+      - TOKEN=${TOKEN}                 # Discord bot token
+    networks:
+      - bot-network
+    # Use host networking to access PostgreSQL running on localhost
+    # For Windows/Mac, use network_mode: "host" if needed
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # This maps host.docker.internal to the host machine
+
+networks:
+  bot-network:
+    driver: bridge
