@@ -594,13 +594,27 @@ def check_event_active() -> bool:
 async def end_event_if_needed() -> bool:
     """End the event if end_time has passed (hybrid: update JSON and DB)"""
     data = load_event_data_json()
-    if data["active"] and data["end_time"] and datetime.datetime.now() > data["end_time"]:
-        data["active"] = False
-        save_event_data_json(data)
-        await save_event_data_to_db(data)
-        global event_data
-        event_data = data
-        return True
+    
+    # Make sure we have end_time and it's properly formatted as datetime
+    if data["active"] and data["end_time"]:
+        # Convert string end_time to datetime if needed
+        end_time = data["end_time"]
+        if isinstance(end_time, str):
+            try:
+                end_time = datetime.datetime.fromisoformat(end_time)
+            except ValueError as e:
+                logger.error(f"Error parsing end_time: {e}")
+                return False
+                
+        # Now compare with current time
+        if datetime.datetime.now() > end_time:
+            data["active"] = False
+            save_event_data_json(data)
+            await save_event_data_to_db(data)
+            global event_data
+            event_data = data
+            return True
+            
     return False
 
 def generate_tribble_rarity() -> int:
@@ -656,177 +670,100 @@ class TribbleButton(discord.ui.View):
     async def capture_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         import discord
         try:
-            # Always defer the interaction immediately for robustness
-            try:
-                await interaction.response.defer(ephemeral=True)
-            except discord.InteractionResponded:
-                pass  # Already responded, continue
-            except Exception as e:
-                logger.error(f"Error deferring interaction: {e}", exc_info=True)
-
-            # Check if the tribble still exists and hasn't been claimed
-            if self.message_id not in event_data["current_drops"] or event_data["current_drops"][self.message_id].get("claimed_by"):
-                try:
-                    await interaction.followup.send("This tribble has already been captured or has escaped!", ephemeral=True)
-                except Exception as e:
-                    logger.error(f"Error sending followup for already captured tribble: {e}", exc_info=True)
+            # Don't defer the interaction - respond immediately to improve user experience
+            # Lock the tribble immediately with a simple dictionary check and update
+            lock_result = await self.lock_tribble_for_capture(interaction.user.id)
+            
+            if not lock_result['success']:
+                await interaction.response.send_message(lock_result['message'], ephemeral=True)
                 return
-
-            # Mark this tribble as claimed immediately
-            event_data["current_drops"][self.message_id]["claimed_by"] = str(interaction.user.id)
-            save_event_data_json(event_data)
-            await save_event_data_to_db(event_data)
-
-            user_id = str(interaction.user.id)
-            # Disable the button immediately
+                
+            # Now we successfully locked this tribble - disable the button immediately
             for child in self.children:
                 child.disabled = True
-
-            success_message = None
-            confirmation_text = None
-            try:
-                if self.rarity == 4:  # Borg tribble
-                    success = random.random() < 0.5
-                    # Show combat animation
+            
+            user_id = str(interaction.user.id)
+            
+            # Prepare to handle different tribble types
+            if self.rarity == 4:  # Borg tribble
+                # Respond immediately by editing the original message to show combat
+                await interaction.response.edit_message(content="⚔️ **COMBAT WITH BORG TRIBBLE IN PROGRESS** ⚔️", view=self)
+                
+                # Then proceed with combat animation
+                success = random.random() < 0.5
+                combat_states = [
+                    {"style": discord.ButtonStyle.primary, "label": "Engaging Borg Tribble..."},
+                    {"style": discord.ButtonStyle.danger, "label": "Resistance Detected!"},
+                    {"style": discord.ButtonStyle.success, "label": "Gaining Advantage..."},
+                    {"style": discord.ButtonStyle.secondary, "label": "Critical Moment!"},
+                ]
+                
+                # Combat animation
+                for state in combat_states:
+                    button.style = state["style"]
+                    button.label = state["label"]
                     try:
-                        await interaction.edit_original_response(content="⚔️ **COMBAT WITH BORG TRIBBLE IN PROGRESS** ⚔️", view=self)
-                    except (discord.NotFound, discord.errors.NotFound):
-                        try:
-                            await interaction.followup.send("Combat with Borg tribble expired or invalid interaction.", ephemeral=True)
-                        except Exception as e:
-                            logger.error(f"Failed to send fallback combat expired message: {e}")
-                        return
+                        await interaction.edit_original_response(view=self)
                     except Exception as e:
-                        logger.error(f"Error editing original response for combat: {e}", exc_info=True)
-                    combat_states = [
-                        {"style": discord.ButtonStyle.primary, "label": "Engaging Borg Tribble..."},
-                        {"style": discord.ButtonStyle.danger, "label": "Resistance Detected!"},
-                        {"style": discord.ButtonStyle.success, "label": "Gaining Advantage..."},
-                        {"style": discord.ButtonStyle.secondary, "label": "Critical Moment!"},
-                    ]
-                    for state in combat_states:
-                        button.style = state["style"]
-                        button.label = state["label"]
-                        try:
-                            await interaction.edit_original_response(view=self)
-                        except (discord.NotFound, discord.errors.NotFound):
-                            try:
-                                await interaction.followup.send("Combat with Borg tribble expired or invalid interaction.", ephemeral=True)
-                            except Exception as e:
-                                logger.error(f"Failed to send fallback combat expired message: {e}")
-                            return
-                        except Exception as e:
-                            logger.error(f"Error animating combat state: {e}", exc_info=True)
-                        await asyncio.sleep(0.7)
-                    if success:
-                        event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + 10
-                        success_message = "Huzzah! You've successfully captured Ten of Eleven! The Borg tribble's assimilation powers have been neutralized, and you've earned a handsome 10 points for your valor!"
-                        confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} and gained 10 points!"
-                        button.style = discord.ButtonStyle.success
-                        button.label = "Tribble Captured!"
-                        
-                        # Update the database: set captured_at timestamp
-                        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        try:
-                            pool = await get_db_pool()
-                            if pool:
-                                async with pool.acquire() as conn:
-                                    async with conn.cursor() as cursor:
-                                        await cursor.execute(
-                                            "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
-                                            (str(interaction.user.id), now, self.message_id)
-                                        )
-                                        await conn.commit()
-                        except Exception as e:
-                            logger.error(f"Failed to update captured_at timestamp: {e}")
-                    else:
-                        event_data["scores"][user_id] = max(0, event_data["scores"].get(user_id, 0) - 10)
-                        success_message = "Oh dear, oh dear! Ten of Eleven has trounced you most thoroughly and — heavens! — loosed a full ten Tribbles into the ether! A costly blunder indeed... I'm afraid you'll be docked 10 points, my friend!"
-                        confirmation_text = f"{interaction.user.mention} was defeated by {get_tribble_emoji(self.rarity)} and lost 10 points!"
-                        button.style = discord.ButtonStyle.danger
-                        button.label = "You Have Been Assimilated"
-                        
-                        # Update was_defeated and is_escaped in the database and event_data
-                        event_data["current_drops"][self.message_id]["was_defeated"] = 1
-                        event_data["current_drops"][self.message_id]["is_escaped"] = 1
-                        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        try:
-                            pool = await get_db_pool()
-                            if pool:
-                                async with pool.acquire() as conn:
-                                    async with conn.cursor() as cursor:
-                                        await cursor.execute(
-                                            "UPDATE tribble_drops SET claimed_by = %s, was_defeated = 1, is_escaped = 1, captured_at = %s WHERE message_id = %s",
-                                            (str(interaction.user.id), now, self.message_id)
-                                        )
-                                        await conn.commit()
-                        except Exception as e:
-                            logger.error(f"Failed to update was_defeated and is_escaped: {e}")
-                    try:
-                        await interaction.edit_original_response(content=None, view=self)
-                    except (discord.NotFound, discord.errors.NotFound):
-                        try:
-                            await interaction.followup.send("This tribble interaction has expired or is no longer valid.", ephemeral=True)
-                        except Exception as e:
-                            logger.error(f"Failed to send fallback expired message: {e}")
-                        return
-                    except Exception as e:
-                        logger.error(f"Error editing original response for result: {e}", exc_info=True)
-                        try:
-                            await interaction.followup.send("An error occurred while capturing the tribble.", ephemeral=True)
-                        except Exception as e2:
-                            logger.error(f"Failed to send fallback error message: {e2}")
-                        return
-                else:
-                    event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + self.rarity
-                    success_message = None
-                    confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} worth {self.rarity} point{'s' if self.rarity > 1 else ''}!"
+                        logger.error(f"Error animating combat state: {e}", exc_info=True)
+                    await asyncio.sleep(0.7)
+                
+                # Process Borg tribble result (moved database operations here)
+                if success:
+                    # User succeeded in combat
+                    event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + 10
+                    success_message = "Huzzah! You've successfully captured Ten of Eleven! The Borg tribble's assimilation powers have been neutralized, and you've earned a handsome 10 points for your valor!"
+                    confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} and gained 10 points!"
                     button.style = discord.ButtonStyle.success
                     button.label = "Tribble Captured!"
                     
-                    # Update the database: set captured_at timestamp
+                    # Update the database in background
                     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    try:
-                        pool = await get_db_pool()
-                        if pool:
-                            async with pool.acquire() as conn:
-                                async with conn.cursor() as cursor:
-                                    await cursor.execute(
-                                        "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
-                                        (str(interaction.user.id), now, self.message_id)
-                                    )
-                                    await conn.commit()
-                    except Exception as e:
-                        logger.error(f"Failed to update captured_at timestamp: {e}")
-                        
-                    try:
-                        await interaction.edit_original_response(content=success_message, view=self)
-                    except (discord.NotFound, discord.errors.NotFound):
-                        try:
-                            await interaction.followup.send("This tribble interaction has expired or is no longer valid.", ephemeral=True)
-                        except Exception as e:
-                            logger.error(f"Failed to send fallback expired message: {e}")
-                        return
-                    except Exception as e:
-                        logger.error(f"Error editing original response for normal tribble: {e}", exc_info=True)
-                        try:
-                            await interaction.followup.send("An error occurred while capturing the tribble.", ephemeral=True)
-                        except Exception as e2:
-                            logger.error(f"Failed to send fallback error message: {e2}")
-                        return
-            except Exception as e:
-                logger.error(f"Error during tribble capture logic: {e}", exc_info=True)
-
+                    asyncio.create_task(self.update_tribble_capture_in_db(user_id, now))
+                else:
+                    # User lost to Borg tribble
+                    event_data["scores"][user_id] = max(0, event_data["scores"].get(user_id, 0) - 10)
+                    success_message = "Oh dear, oh dear! Ten of Eleven has trounced you most thoroughly and — heavens! — loosed a full ten Tribbles into the ether! A costly blunder indeed... I'm afraid you'll be docked 10 points, my friend!"
+                    confirmation_text = f"{interaction.user.mention} was defeated by {get_tribble_emoji(self.rarity)} and lost 10 points!"
+                    button.style = discord.ButtonStyle.danger
+                    button.label = "You Have Been Assimilated"
+                    
+                    # Update was_defeated and is_escaped in the database and event_data
+                    event_data["current_drops"][self.message_id]["was_defeated"] = 1
+                    event_data["current_drops"][self.message_id]["is_escaped"] = 1
+                    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    asyncio.create_task(self.update_tribble_defeat_in_db(user_id, now))
+                
+                try:
+                    # Update the original message with the result
+                    await interaction.edit_original_response(content=success_message, view=self)
+                except Exception as e:
+                    logger.error(f"Error editing original response for result: {e}", exc_info=True)
+            else:
+                # Regular tribble - immediately update the original message
+                button.style = discord.ButtonStyle.success
+                button.label = "Tribble Captured!"
+                await interaction.response.edit_message(view=self)
+                
+                # Process regular tribble capture (database operations moved here)
+                event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + self.rarity
+                confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} worth {self.rarity} point{'s' if self.rarity > 1 else ''}!"
+                
+                # Update the database in background
+                now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                asyncio.create_task(self.update_tribble_capture_in_db(user_id, now))
+            
+            # Save event data to JSON (can be done asynchronously now)
+            asyncio.create_task(self.save_event_data_async(event_data))
+            
+            # Send confirmation message to channel
             confirmation_message = None
-            if confirmation_text:
-                try:
-                    confirmation_message = await interaction.channel.send(confirmation_text)
-                except Exception as e:
-                    logger.error(f"Error sending confirmation text to channel: {e}", exc_info=True)
-                try:
-                    await self.cleanup_infestation_messages(self.batch_id, interaction.guild)
-                except Exception as e:
-                    logger.error(f"Error cleaning up infestation messages: {e}", exc_info=True)
+            try:
+                confirmation_message = await interaction.channel.send(confirmation_text)
+                asyncio.create_task(self.cleanup_infestation_messages(self.batch_id, interaction.guild))
+            except Exception as e:
+                logger.error(f"Error sending confirmation text to channel: {e}", exc_info=True)
+            
             # Delete the original tribble message after a short delay
             try:
                 original_message = await interaction.channel.fetch_message(int(self.message_id))
@@ -834,6 +771,7 @@ class TribbleButton(discord.ui.View):
                 await original_message.delete()
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass  # Message already deleted or no permission
+            
             # Delete the confirmation message after a shorter delay
             if confirmation_message:
                 try:
@@ -843,18 +781,57 @@ class TribbleButton(discord.ui.View):
                     pass  # Message already deleted or no permission
         except Exception as e:
             logger.error(f"Error in capture_button: {e}")
-            await interaction.response.send_message("An error occurred while capturing the tribble.", ephemeral=True)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass  # Message already deleted or no permission
+            try:
+                await interaction.response.send_message("An error occurred while capturing the tribble.", ephemeral=True)
+            except discord.InteractionResponded:
+                await interaction.followup.send("An error occurred while capturing the tribble.", ephemeral=True)
+            except Exception:
+                pass  # Already handled
 
-    async def delete_after_delay(self, message, delay):
-        """Delete a message after a specified delay in seconds"""
-        try:
-            await asyncio.sleep(delay)
-            await message.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass  # Message already deleted or no permission
+    async def lock_tribble_for_capture(self, user_id: str) -> dict:
+        """Atomically check and lock a tribble for capture to prevent race conditions"""
+        if self.message_id not in event_data["current_drops"] or event_data["current_drops"][self.message_id].get("claimed_by"):
+            return {"success": False, "message": "This tribble has already been captured or has escaped!"}
         
+        # Lock the tribble by setting claimed_by
+        event_data["current_drops"][self.message_id]["claimed_by"] = str(user_id)
+        return {"success": True, "message": "Tribble locked for capture"}
+
+    async def save_event_data_async(self, data):
+        """Save event data to JSON and DB asynchronously"""
+        save_event_data_json(data)
+        await save_event_data_to_db(data)
+
+    async def update_tribble_capture_in_db(self, user_id: str, timestamp: str):
+        """Update tribble capture information in the database"""
+        try:
+            pool = await get_db_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
+                            (str(user_id), timestamp, self.message_id)
+                        )
+                        await conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to update captured_at timestamp: {e}")
+
+    async def update_tribble_defeat_in_db(self, user_id: str, timestamp: str):
+        """Update tribble defeat information in the database"""
+        try:
+            pool = await get_db_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            "UPDATE tribble_drops SET claimed_by = %s, was_defeated = 1, is_escaped = 1, captured_at = %s WHERE message_id = %s",
+                            (str(user_id), timestamp, self.message_id)
+                        )
+                        await conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to update was_defeated and is_escaped: {e}")
+
     async def cleanup_infestation_messages(self, batch_id: str, guild: discord.Guild):
         """Clean up infestation alert and confirmation messages"""
         try:
@@ -1267,7 +1244,6 @@ async def check_tribble_capture_completion(batch_id: str, guild: discord.Guild):
                                     f"• {escaped} tribbles escaped"
                                 ))
                                 
-                                # Wait before deleting the message
                                 await asyncio.sleep(20)
                                 await message.delete()
                                 
