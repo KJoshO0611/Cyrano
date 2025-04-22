@@ -331,6 +331,7 @@ async def init_database():
                         score INT NOT NULL DEFAULT 0,
                         guild_id VARCHAR(20) NOT NULL,
                         event_id INT NOT NULL,
+                        username VARCHAR(100) NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         PRIMARY KEY (id),
@@ -716,8 +717,11 @@ class TribbleButton(discord.ui.View):
                     confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} and gained 10 points!"
                     button.style = discord.ButtonStyle.success
                     button.label = "Tribble Captured!"
-                    
-                    # Update the database in background
+                    save_event_data_json(event_data)
+                    username = interaction.user.display_name if hasattr(interaction.user, 'display_name') else interaction.user.name
+                    guild_id = str(interaction.guild.id) if interaction.guild else None
+                    event_id = event_data.get("event_id")
+                    asyncio.create_task(self.sync_score_to_db(user_id, event_data["scores"][user_id], username, guild_id, event_id))
                     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     asyncio.create_task(self.update_tribble_capture_in_db(user_id, now))
                 else:
@@ -727,10 +731,13 @@ class TribbleButton(discord.ui.View):
                     confirmation_text = f"{interaction.user.mention} was defeated by {get_tribble_emoji(self.rarity)} and lost 10 points!"
                     button.style = discord.ButtonStyle.danger
                     button.label = "You Have Been Assimilated"
-                    
-                    # Update was_defeated and is_escaped in the database and event_data
                     event_data["current_drops"][self.message_id]["was_defeated"] = 1
                     event_data["current_drops"][self.message_id]["is_escaped"] = 1
+                    save_event_data_json(event_data)
+                    username = interaction.user.display_name if hasattr(interaction.user, 'display_name') else interaction.user.name
+                    guild_id = str(interaction.guild.id) if interaction.guild else None
+                    event_id = event_data.get("event_id")
+                    asyncio.create_task(self.sync_score_to_db(user_id, event_data["scores"][user_id], username, guild_id, event_id))
                     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     asyncio.create_task(self.update_tribble_defeat_in_db(user_id, now))
                 
@@ -747,11 +754,12 @@ class TribbleButton(discord.ui.View):
                 
                 # Process regular tribble capture (database operations moved here)
                 event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + self.rarity
+                save_event_data_json(event_data)
+                username = interaction.user.display_name if hasattr(interaction.user, 'display_name') else interaction.user.name
+                guild_id = str(interaction.guild.id) if interaction.guild else None
+                event_id = event_data.get("event_id")
+                asyncio.create_task(self.sync_score_to_db(user_id, event_data["scores"][user_id], username, guild_id, event_id))
                 confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} worth {self.rarity} point{'s' if self.rarity > 1 else ''}!"
-                
-                # Update the database in background
-                now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                asyncio.create_task(self.update_tribble_capture_in_db(user_id, now))
             
             # Save event data to JSON (can be done asynchronously now)
             asyncio.create_task(self.save_event_data_async(event_data))
@@ -885,6 +893,22 @@ class TribbleButton(discord.ui.View):
                     save_event_data(event_data)
         except Exception as e:
             logger.error(f"Error cleaning up infestation messages: {e}")
+
+    async def sync_score_to_db(self, user_id: str, score: int, username: str, guild_id: str, event_id: int):
+        """Sync the user's score and username to the database in the background."""
+        try:
+            pool = await get_db_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            "INSERT INTO tribble_scores (user_id, score, username, guild_id, event_id) VALUES (%s, %s, %s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE score = %s, username = %s",
+                            (user_id, score, username, guild_id, event_id, score, username)
+                        )
+                        await conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to sync score for user {user_id} to DB: {e}")
 
 # Add this after the TribbleButton class and before the Bot commands section
 
