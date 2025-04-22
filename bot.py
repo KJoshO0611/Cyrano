@@ -1854,15 +1854,14 @@ async def animate_tribble_escape(message: discord.Message):
             logger.error(f"Error in escape animation: {e}")
 
 # Run the bot
-TOKEN = "MTM2MjU5MDYzOTE4MjgzOTgyOA.Gjg9bc.E8UGTRpO1qQmSWJv6waVU-UJThU7uEeF7R1cA0"  # Replace with your actual bot token
 @bot.event
 async def on_error(event, *args, **kwargs):
     print(f"Error in {event}: {args} {kwargs}")
 
 async def main():
     async with bot:
-        await bot.start(TOKEN)
+        await bot.start(os.getenv("TOKEN"))
 
 if __name__ == "__main__":
     # Change this line to use the TOKEN variable directly
-    bot.run(TOKEN)
+    bot.run(os.getenv("TOKEN"))
