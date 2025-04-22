@@ -1703,7 +1703,22 @@ async def schedule_tribble_expiration(message: discord.Message, message_id: str,
                 # Remove from current drops
                 del event_data["current_drops"][message_id]
                 save_event_data(event_data)
-                
+
+                # --- DB update: mark tribble as escaped ---
+                try:
+                    pool = await get_db_pool()
+                    if pool:
+                        async with pool.acquire() as conn:
+                            async with conn.cursor() as cursor:
+                                await cursor.execute(
+                                    "UPDATE tribble_drops SET is_escaped = 1 WHERE message_id = %s",
+                                    (message_id,)
+                                )
+                                await conn.commit()
+                        logger.info(f"Marked tribble {message_id} as escaped in DB.")
+                except Exception as e:
+                    logger.error(f"Failed to update is_escaped for tribble {message_id}: {e}")
+
                 # Delete the message
                 await message.delete()
             except Exception as e:
