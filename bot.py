@@ -189,8 +189,6 @@ async def drop_tribble(channel: discord.TextChannel, rarity: int, batch_id: Opti
     elif rarity == 4:
         embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1362762779429306588.png")
     
-    # ... rest of the function remains the same ...
-    
     # Create the button with emoji
     view = TribbleButton(rarity=rarity, message_id="placeholder", batch_id=batch_id)
     
@@ -208,6 +206,10 @@ async def drop_tribble(channel: discord.TextChannel, rarity: int, batch_id: Opti
         
         if batch_id:
             event_data["current_drops"][str(message.id)]["batch_id"] = batch_id
+            
+        # Set is_borg flag for rarity 4 tribbles
+        if rarity == 4:
+            event_data["current_drops"][str(message.id)]["is_borg"] = 1
             
         save_event_data_json(event_data)
         await save_event_data_to_db(event_data)
@@ -254,8 +256,7 @@ def save_event_data(data: Dict) -> None:
         json.dump(data_to_save, f, indent=2)
 
 
-# Load initial data
-event_data = load_event_data_json()
+# Load initial dataevent_data = load_event_data_json()
 
 # Find the get_db_pool function and modify it to handle connection issues better
 async def get_db_pool():
@@ -297,6 +298,7 @@ async def init_database():
     global event_data, using_in_memory_storage
     
     try:
+        # Initialize database
         pool = await get_db_pool()
         
         if pool is None:
@@ -346,6 +348,9 @@ async def init_database():
                         claimed_by VARCHAR(20),
                         batch_id VARCHAR(36),
                         is_escaped TINYINT(1) NOT NULL DEFAULT 0,
+                        is_borg TINYINT(1) NOT NULL DEFAULT 0,
+                        was_defeated TINYINT(1) NOT NULL DEFAULT 0,
+                        captured_at TIMESTAMP NULL,
                         guild_id VARCHAR(20) NOT NULL,
                         event_id INT NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -510,16 +515,20 @@ async def save_event_data_to_db(data: Dict) -> None:
                         await cursor.execute(
                             """
                             INSERT INTO tribble_drops 
-                            (message_id, channel_id, guild_id, rarity, claimed_by, batch_id, event_id, is_escaped) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
+                            (message_id, channel_id, guild_id, rarity, claimed_by, batch_id, event_id, is_escaped, is_borg, was_defeated) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
                             ON DUPLICATE KEY UPDATE 
-                            channel_id = %s, rarity = %s, claimed_by = %s, batch_id = %s, is_escaped = 0
+                            channel_id = %s, rarity = %s, claimed_by = %s, batch_id = %s, is_escaped = 0, is_borg = %s, was_defeated = %s
                             """,
                             (
                                 message_id, drop_data["channel_id"], guild_id, drop_data["rarity"], 
                                 drop_data.get("claimed_by"), drop_data.get("batch_id"), event_id,
+                                1 if drop_data.get("is_borg") else 0,
+                                1 if drop_data.get("was_defeated") else 0,
                                 drop_data["channel_id"], drop_data["rarity"], drop_data.get("claimed_by"), 
-                                drop_data.get("batch_id")
+                                drop_data.get("batch_id"),
+                                1 if drop_data.get("is_borg") else 0,
+                                1 if drop_data.get("was_defeated") else 0
                             )
                         )
                     
@@ -715,12 +724,44 @@ class TribbleButton(discord.ui.View):
                         confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} and gained 10 points!"
                         button.style = discord.ButtonStyle.success
                         button.label = "Tribble Captured!"
+                        
+                        # Update the database: set captured_at timestamp
+                        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        try:
+                            pool = await get_db_pool()
+                            if pool:
+                                async with pool.acquire() as conn:
+                                    async with conn.cursor() as cursor:
+                                        await cursor.execute(
+                                            "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
+                                            (str(interaction.user.id), now, self.message_id)
+                                        )
+                                        await conn.commit()
+                        except Exception as e:
+                            logger.error(f"Failed to update captured_at timestamp: {e}")
                     else:
                         event_data["scores"][user_id] = max(0, event_data["scores"].get(user_id, 0) - 10)
                         success_message = "Oh dear, oh dear! Ten of Eleven has trounced you most thoroughly and — heavens! — loosed a full ten Tribbles into the ether! A costly blunder indeed... I'm afraid you'll be docked 10 points, my friend!"
                         confirmation_text = f"{interaction.user.mention} was defeated by {get_tribble_emoji(self.rarity)} and lost 10 points!"
                         button.style = discord.ButtonStyle.danger
                         button.label = "You Have Been Assimilated"
+                        
+                        # Update was_defeated and is_escaped in the database and event_data
+                        event_data["current_drops"][self.message_id]["was_defeated"] = 1
+                        event_data["current_drops"][self.message_id]["is_escaped"] = 1
+                        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        try:
+                            pool = await get_db_pool()
+                            if pool:
+                                async with pool.acquire() as conn:
+                                    async with conn.cursor() as cursor:
+                                        await cursor.execute(
+                                            "UPDATE tribble_drops SET claimed_by = %s, was_defeated = 1, is_escaped = 1, captured_at = %s WHERE message_id = %s",
+                                            (str(interaction.user.id), now, self.message_id)
+                                        )
+                                        await conn.commit()
+                        except Exception as e:
+                            logger.error(f"Failed to update was_defeated and is_escaped: {e}")
                     try:
                         await interaction.edit_original_response(content=None, view=self)
                     except (discord.NotFound, discord.errors.NotFound):
@@ -742,6 +783,22 @@ class TribbleButton(discord.ui.View):
                     confirmation_text = f"{interaction.user.mention} captured {get_tribble_emoji(self.rarity)} worth {self.rarity} point{'s' if self.rarity > 1 else ''}!"
                     button.style = discord.ButtonStyle.success
                     button.label = "Tribble Captured!"
+                    
+                    # Update the database: set captured_at timestamp
+                    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    try:
+                        pool = await get_db_pool()
+                        if pool:
+                            async with pool.acquire() as conn:
+                                async with conn.cursor() as cursor:
+                                    await cursor.execute(
+                                        "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
+                                        (str(interaction.user.id), now, self.message_id)
+                                    )
+                                    await conn.commit()
+                    except Exception as e:
+                        logger.error(f"Failed to update captured_at timestamp: {e}")
+                        
                     try:
                         await interaction.edit_original_response(content=success_message, view=self)
                     except (discord.NotFound, discord.errors.NotFound):
@@ -857,6 +914,7 @@ class TribbleButton(discord.ui.View):
 
 
 # Add this after the TribbleButton class and before the Bot commands section
+
             
 
 # Add this after the TribbleButton class and before the Bot commands section
@@ -1115,11 +1173,6 @@ async def tribble_infestation(interaction: discord.Interaction, channel: Optiona
         
         # Shuffle channels to ensure random distribution
         random.shuffle(text_channels)
-    
-    # Generate a batch ID for this infestation
-    batch_id = f"infestation-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
-    # Rest of your existing code...
     
     # Generate a batch ID for this infestation
     batch_id = f"infestation-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -1704,18 +1757,19 @@ async def schedule_tribble_expiration(message: discord.Message, message_id: str,
                 del event_data["current_drops"][message_id]
                 save_event_data(event_data)
 
-                # --- DB update: mark tribble as escaped ---
+                # --- DB update: mark tribble as escaped and set captured_at timestamp ---
                 try:
                     pool = await get_db_pool()
+                    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     if pool:
                         async with pool.acquire() as conn:
                             async with conn.cursor() as cursor:
                                 await cursor.execute(
-                                    "UPDATE tribble_drops SET is_escaped = 1 WHERE message_id = %s",
-                                    (message_id,)
+                                    "UPDATE tribble_drops SET is_escaped = 1, captured_at = %s WHERE message_id = %s",
+                                    (now, message_id)
                                 )
                                 await conn.commit()
-                        logger.info(f"Marked tribble {message_id} as escaped in DB.")
+                        logger.info(f"Marked tribble {message_id} as escaped in DB with timestamp {now}.")
                 except Exception as e:
                     logger.error(f"Failed to update is_escaped for tribble {message_id}: {e}")
 
