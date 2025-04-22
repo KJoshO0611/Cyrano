@@ -754,7 +754,7 @@ class TribbleButton(discord.ui.View):
                 
                 # Process regular tribble capture (database operations moved here)
                 event_data["scores"][user_id] = event_data["scores"].get(user_id, 0) + self.rarity
-                save_event_data_json(event_data)
+                save_event_data(event_data)
                 username = interaction.user.display_name if hasattr(interaction.user, 'display_name') else interaction.user.name
                 guild_id = str(interaction.guild.id) if interaction.guild else None
                 event_id = event_data.get("event_id")
@@ -813,6 +813,7 @@ class TribbleButton(discord.ui.View):
     async def update_tribble_capture_in_db(self, user_id: str, timestamp: str):
         """Update tribble capture information in the database"""
         try:
+            logger.info(f"Updating DB for captured tribble: user_id={user_id}, message_id={self.message_id}, timestamp={timestamp}")
             pool = await get_db_pool()
             if pool:
                 async with pool.acquire() as conn:
@@ -821,6 +822,13 @@ class TribbleButton(discord.ui.View):
                             "UPDATE tribble_drops SET claimed_by = %s, captured_at = %s WHERE message_id = %s",
                             (str(user_id), timestamp, self.message_id)
                         )
+                        logger.info(f"DB update result for message_id={self.message_id}: {cursor.rowcount} row(s) affected.")
+                        await cursor.execute(
+                            "SELECT was_defeated, is_escaped, claimed_by, captured_at FROM tribble_drops WHERE message_id = %s",
+                            (self.message_id,)
+                        )
+                        row = await cursor.fetchone()
+                        logger.info(f"DB row after capture update for message_id={self.message_id}: {row}")
                         await conn.commit()
         except Exception as e:
             logger.error(f"Failed to update captured_at timestamp: {e}")
@@ -828,14 +836,22 @@ class TribbleButton(discord.ui.View):
     async def update_tribble_defeat_in_db(self, user_id: str, timestamp: str):
         """Update tribble defeat information in the database"""
         try:
+            logger.info(f"Updating DB for defeated tribble: user_id={user_id}, message_id={self.message_id}, timestamp={timestamp}")
             pool = await get_db_pool()
             if pool:
                 async with pool.acquire() as conn:
-                    async with conn.cursor() as cursor:
+                    async with conn.cursor(aiomysql.DictCursor) as cursor:
                         await cursor.execute(
                             "UPDATE tribble_drops SET claimed_by = %s, was_defeated = 1, is_escaped = 1, captured_at = %s WHERE message_id = %s",
                             (str(user_id), timestamp, self.message_id)
                         )
+                        logger.info(f"DB update result for message_id={self.message_id}: {cursor.rowcount} row(s) affected.")
+                        await cursor.execute(
+                            "SELECT was_defeated, is_escaped, claimed_by, captured_at FROM tribble_drops WHERE message_id = %s",
+                            (self.message_id,)
+                        )
+                        row = await cursor.fetchone()
+                        logger.info(f"DB row after defeat update for message_id={self.message_id}: {row}")
                         await conn.commit()
         except Exception as e:
             logger.error(f"Failed to update was_defeated and is_escaped: {e}")
@@ -1765,11 +1781,16 @@ async def schedule_tribble_expiration(message: discord.Message, message_id: str,
                         async with pool.acquire() as conn:
                             async with conn.cursor() as cursor:
                                 await cursor.execute(
-                                    "UPDATE tribble_drops SET is_escaped = 1, captured_at = %s WHERE message_id = %s",
+                                    "UPDATE tribble_drops SET is_escaped = 1, captured_at = %s WHERE message_id = %s AND was_defeated = 0",
                                     (now, message_id)
                                 )
+                                await cursor.execute(
+                                    "SELECT was_defeated, is_escaped, claimed_by, captured_at FROM tribble_drops WHERE message_id = %s",
+                                    (message_id,)
+                                )
+                                row = await cursor.fetchone()
+                                logger.info(f"DB row after escape update for message_id={message_id}: {row}")
                                 await conn.commit()
-                        logger.info(f"Marked tribble {message_id} as escaped in DB with timestamp {now}.")
                 except Exception as e:
                     logger.error(f"Failed to update is_escaped for tribble {message_id}: {e}")
 
