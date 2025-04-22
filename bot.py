@@ -27,11 +27,11 @@ logger = logging.getLogger("tribble_bot")
 
 # Database configuration
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "uk02-sql.pebblehost.com"),
-    "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "customer_689278_STFC"),
-    "password": os.getenv("DB_PASSWORD", "ckI64@nmO@i=eiU9i+4wNy.K"),
-    "db": os.getenv("DB_NAME", "customer_689278_STFC"),
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT")),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "db": os.getenv("DB_NAME"),
     "autocommit": True,
     "minsize": 5,
     "maxsize": 20,
